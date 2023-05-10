@@ -261,3 +261,10 @@ com_crashlytics_export_strings.xml
 crashlytics.properties
 crashlytics-build.properties
 fabric.properties
+
+.history/
+*.xml
+*.onnx
+*.bin
+*.pt
+*.[mM][pP]4
