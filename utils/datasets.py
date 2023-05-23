@@ -18,6 +18,8 @@ import torch
 import torch.nn.functional as F
 from PIL import Image, ExifTags
 from torch.utils.data import Dataset
+import torchvision
+from torchvision.io import VideoReader
 from tqdm import tqdm
 
 import pickle
@@ -235,6 +237,119 @@ class LoadImages:  # for inference
 
     def __len__(self):
         return self.nf  # number of files
+
+
+class VideoDataset(torch.utils.data.IterableDataset):  # for inference
+    def __init__(self,
+                 path,
+                 img_size=640,
+                 stride=32,
+                 auto=True,
+                 read_interval=1,
+                 crop_xyxy=None):
+        super().__init__()
+
+        self.path = str(Path(path).absolute())
+        self.read_interval = read_interval
+        self.img_size = img_size
+        self.stride = stride
+        self.auto = auto
+        self.crop_xyxy = crop_xyxy
+        self.new_video(self.path)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        while True:
+            ret_val, frame = self.cap.read()
+            if not ret_val:
+                self.cap.release()
+                raise StopIteration
+
+            self.frame_idx += 1
+            if self.frame_idx % self.read_interval == 0:
+                break
+
+        if self.crop_xyxy is not None:
+            x0, y0, x1, y1 = self.crop_xyxy
+            frame = frame[y0:y1, x0:x1]
+        # Padded resize
+        img, *_ = letterbox(
+            frame, self.img_size, stride=self.stride, auto=self.auto)
+        # BGR to RGB, HWC to CHW
+        img = img[:, :, ::-1].transpose(2, 0, 1)
+        img = np.ascontiguousarray(img)
+        return img, frame
+
+    def new_video(self, path):
+        self.frame_idx = 0
+        cap = cv2.VideoCapture(path)
+        self.nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.fps = cap.get(cv2.CAP_PROP_FPS)
+        self.duration = self.nframes / self.fps
+        self.frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.cap = cap
+
+
+class VideoDatasetTorchVision(torch.utils.data.IterableDataset):
+    def __init__(self,
+                 path,
+                 img_size=640,
+                 stride=32,
+                 auto=True,
+                 read_interval=1,
+                 crop_xyxy=None):
+        super().__init__()
+
+        self.path = str(Path(path).absolute())
+        self.read_interval = read_interval
+        self.img_size = img_size
+        self.stride = stride
+        self.auto = auto
+        self.crop_xyxy = crop_xyxy
+        self.new_video(self.path)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.frame_idx % self.read_interval == 0:
+            frame = next(self.frame_iter)['data']
+            self.frame_idx += 1
+        else:
+            while self.frame_idx % self.read_interval != 0:
+                frame = next(self.frame_iter)['data']
+                self.frame_idx += 1
+
+        if self.crop_xyxy is not None:
+            x0, y0, x1, y1 = self.crop_xyxy
+            frame = frame[..., y0:y1, x0:x1]
+
+        frame = frame.permute(1, 2, 0).numpy()
+
+        # Padded resize
+        img, *_ = letterbox(
+            frame, self.img_size, stride=self.stride, auto=self.auto)
+
+        img = np.ascontiguousarray(img)
+        img = torch.from_numpy(img).permute(2, 0, 1)
+
+        return img, frame
+
+    def new_video(self, path):
+        # use OpenCV to get video metadata; for some reason TorchVision's
+        # VideoReader doesn't always succeed in getting it
+        cap = cv2.VideoCapture(path)
+        self.nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.fps = cap.get(cv2.CAP_PROP_FPS)
+        self.duration = self.nframes / self.fps
+        cap.release()
+
+        self.reader = VideoReader(path)
+        self.frame_iter = iter(self.reader)
+        self.frame_idx = -1
 
 
 class LoadWebcam:  # for inference

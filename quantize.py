@@ -17,7 +17,7 @@ log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
 
 
-def get_dataloader(data_root: str, img_size: int):
+def get_dataloader(data_root: str, img_size: int, batch_size: int = 1):
     # read dataset config
     data_config = join(data_root, 'coco.yaml')
     with open(data_config) as f:
@@ -29,7 +29,12 @@ def get_dataloader(data_root: str, img_size: int):
     Option = namedtuple('Options', ['single_cls'])
     opt = Option(False)
     dataloader, _ = create_dataloader(
-        data['val'], imgsz=img_size, batch_size=1, stride=32, opt=opt, pad=0.5)
+        data['val'],
+        imgsz=img_size,
+        batch_size=batch_size,
+        stride=32,
+        opt=opt,
+        pad=0.5)
     return dataloader
 
 
@@ -57,6 +62,7 @@ if __name__ == '__main__':
     parser.add_argument('--model-out', type=str, help='Output model path')
     parser.add_argument(
         '--img-size', type=int, default=640, help='Inference size (pixels)')
+    parser.add_argument('--batch-size', type=int, default=1, help='batch size')
     opt = parser.parse_args()
 
     log.info('Reading model')
@@ -64,7 +70,8 @@ if __name__ == '__main__':
     model = core.read_model(opt.model_in)
 
     log.info('Creating dataloader')
-    dataloader = get_dataloader(opt.data_root, opt.img_size)
+    dataloader = get_dataloader(
+        opt.data_root, opt.img_size, batch_size=opt.batch_size)
 
     log.info('Quantizing')
     quantized_model = quantize(model, dataloader)
