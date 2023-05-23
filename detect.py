@@ -1,16 +1,19 @@
-from os.path import join
-import argparse
+from typing import List, Optional, Tuple
+from os import makedirs
+from os.path import dirname
+from jsonargparse import ArgumentParser, ActionConfigFile
 from pathlib import Path
 import json
 
+import numpy as np
 import cv2
 import torch
-import numpy as np
+from torch.utils.data import DataLoader
 
 from models.experimental import attempt_load
-from utils.datasets import LoadImages
+from utils.datasets import VideoDataset, VideoDatasetTorchVision
 from utils.general import (check_img_size, non_max_suppression, scale_coords,
-                           xyxy2xywh, set_logging, increment_path)
+                           set_logging)
 from utils.plots import plot_one_box
 from utils.torch_utils import select_device, time_synchronized
 
@@ -31,61 +34,104 @@ CLASS_NAMES = [
 ]
 
 
-def detect():
-    source, weights, view_img, save_txt, imgsz = (opt.source, opt.weights,
-                                                  opt.view_img, opt.save_txt,
-                                                  opt.img_size)
-    save_img = not opt.nosave
-
-    # Directories
-    save_dir = Path(
-        increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))
-    (save_dir / 'labels' if save_txt else save_dir).mkdir(
-        parents=True, exist_ok=True)  # make dir
-    out_json_path = join(save_dir, 'predictions.json')
-
+def detect(video: str,
+           model_path: str,
+           out_json_path: bool,
+           img_size: int,
+           conf_thresh: float,
+           iou_thresh: float,
+           stride: int,
+           device: str,
+           agnostic_nms: bool = False,
+           classes: Optional[List[int]] = None,
+           out_video_path: Optional[str] = None,
+           frame_predict_interval: Optional[int] = None,
+           crop: Optional[Tuple[int, int, int, int]] = None,
+           torchvision_video_reader: bool = False,
+           batch_size: Optional[int] = None,
+           num_workers: int = 0,
+           debug: bool = False):
     # Initialize
     set_logging()
-    device = select_device(opt.device)
+    device = select_device(device)
 
     # Load model
-    model = attempt_load(weights[:1], map_location=device)  # load FP32 model
-    stride = int(model.stride.max())  # model stride
-    imgsz = check_img_size(imgsz, s=stride)  # check img_size
+    img_size = check_img_size(img_size, s=stride)
 
     # colors for visualization
-    colors = [np.random.randint(0, 255, size=3).tolist() for _ in CLASS_NAMES]
+    colors = (
+        [[0, 0, 255]] +
+        [np.random.randint(0, 255, size=3).tolist() for _ in CLASS_NAMES[1:]])
 
-    if opt.openvino is not None:
+    is_openvino = Path(model_path).suffix == '.xml'
+    if is_openvino:
         from openvino.runtime import Core
         core = Core()
         # read converted model
-        model = core.read_model(opt.openvino)
+        model = core.read_model(model_path)
         model = core.compile_model(model, 'CPU')
         output_blob = model.output(0)
+    else:
+        model = attempt_load(model_path, map_location=device)
 
     # Set Dataloader
-    vid_path, vid_writer = None, None
-    dataset = LoadImages(source, img_size=imgsz, stride=stride, auto=False)
+    if torchvision_video_reader:
+        ds_cls = VideoDatasetTorchVision
+    else:
+        ds_cls = VideoDataset
+    dataset = ds_cls(
+        video,
+        img_size=img_size,
+        stride=stride,
+        auto=False,
+        read_interval=frame_predict_interval,
+        crop_xyxy=crop,
+    )
+    dataloader = DataLoader(
+        dataset, batch_size=batch_size, num_workers=num_workers)
 
-    pred_interval = opt.frame_predict_interval
+    # init vid_writer
+    save_vid = out_video_path is not None
+    if save_vid:
+        fps = dataset.fps
+        w = dataset.frame_w
+        h = dataset.frame_h
+        if crop is not None:
+            x0, y0, x1, y1 = crop
+            if x0 < 0:
+                x0 += w
+            if y0 < 0:
+                y0 += h
+            if x1 < 0:
+                x1 += w
+            if y1 < 0:
+                y1 += h
+            h, w = y1 - y0, x1 - x0
+        vid_writer = cv2.VideoWriter(out_video_path,
+                                     cv2.VideoWriter_fourcc(*'mp4v'), fps,
+                                     (w, h))
+
     nframes = dataset.nframes
     duration = dataset.duration
     fps = dataset.fps
     all_dets = {}
-    for frame_idx, (path, img, im0s, vid_cap) in enumerate(dataset):
-        if frame_idx % pred_interval != 0:
-            continue
-        vid_frac = frame_idx / nframes
-        timestamp = duration * vid_frac
-        print(f'({frame_idx}/{nframes}): ', end='')
-        img = torch.from_numpy(img).to(device=device, dtype=torch.float32)
+    frames_processed = 0
+    for batch in dataloader:
+        if debug and frames_processed >= 50:
+            break
+        img, raw_frames = batch
+        N = len(img)
+        raw_frames = raw_frames.numpy()
+        batch_frame_inds = frames_processed + np.arange(N, dtype=int)
+        frames_processed += N
+        batch_frame_timestamps = duration * (batch_frame_inds / nframes)
+        img = img.to(device=device, dtype=torch.float32)
         img /= 255.0
         if img.ndimension() == 3:
             img = img.unsqueeze(0)
 
         # Inference
-        if opt.openvino is not None:
+        if is_openvino:
             t1 = time_synchronized()
             with torch.inference_mode():
                 pred = model(img)[output_blob]
@@ -100,87 +146,53 @@ def detect():
         # Apply NMS
         pred = non_max_suppression(
             pred,
-            opt.conf_thres,
-            opt.iou_thres,
-            classes=opt.classes,
-            agnostic=opt.agnostic_nms)
+            conf_thresh,
+            iou_thresh,
+            classes=classes,
+            agnostic=agnostic_nms)
         t3 = time_synchronized()
 
         # Process detections
-        for i, det in enumerate(pred):  # detections per image
-            p, s, im0, frame = path, '', im0s, getattr(dataset, 'frame', 0)
-            p = Path(p)  # to Path
-            save_path = str(save_dir / p.name)  # img.jpg
-            txt_path = str(save_dir / 'labels' / p.stem) + (
-                '' if dataset.mode == 'image' else f'_{frame}')  # img.txt
-            # normalization gain whwh
-            whwh_tensor = torch.tensor(im0.shape)[[1, 0, 1, 0]]
+        for i, (det, raw_frame, frame_idx, frame_timestamp) in enumerate(
+                zip(pred, raw_frames, batch_frame_inds,
+                    batch_frame_timestamps)):
+            print(f'({frame_idx}/{nframes}): ', end='')
             if len(det):
-                # Rescale boxes from img_size to im0 size
+                # Rescale boxes from img_size to raw_frame size
                 det[:, :4] = scale_coords(img.shape[2:], det[:, :4],
-                                          im0.shape).round()
+                                          raw_frame.shape).round()
 
                 all_dets[frame_idx] = dict(
-                    frame_idx=frame_idx, timestamp=timestamp, det=det)
+                    frame_idx=int(frame_idx),
+                    timestamp=float(frame_timestamp),
+                    det=det)
 
                 # Print results
+                s = ''
                 for c in det[:, -1].unique():
                     n = (det[:, -1] == c).sum()  # detections per class
                     s += f"{n} {CLASS_NAMES[int(c)]}{'s' * (n > 1)}, "
+                print(s)
 
                 # Write results
-                for *xyxy, conf, cls in reversed(det):
-                    if save_txt:  # Write to file
-                        # normalized xywh
-                        xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) /
-                                whwh_tensor).view(-1).tolist()
-                        # label format
-                        line = (cls, *xywh, conf) if opt.save_conf else (cls,
-                                                                         *xywh)
-                        with open(txt_path + '.txt', 'a') as f:
-                            f.write(('%g ' * len(line)).rstrip() % line + '\n')
-
-                    if save_img or view_img:  # Add bbox to image
-                        label = f'{CLASS_NAMES[int(cls)]} {conf:.2f}'
+                if save_vid:
+                    for *xyxy, conf, cls in reversed(det):
+                        cls = int(cls)
+                        label = f'{CLASS_NAMES[cls]} {conf:.2f}'
                         plot_one_box(
                             xyxy,
-                            im0,
+                            raw_frame,
                             label=label,
                             color=colors[int(cls)],
                             line_thickness=4)
 
             # Print time (inference + NMS)
-            print(f'{s}Done. ({(1E3 * (t2 - t1)):.1f}ms) Inference, '
+            print(f'Done. ({(1E3 * (t2 - t1)):.1f}ms) Inference, '
                   f'({(1E3 * (t3 - t2)):.1f}ms) NMS')
 
-            # Stream results
-            if view_img:
-                cv2.imshow(str(p), im0)
-                cv2.waitKey(1)  # 1 millisecond
-
-            # Save results (image with detections)
-            if save_img:
-                if dataset.mode == 'image':
-                    cv2.imwrite(save_path, im0)
-                    print(
-                        f" The image with the result is saved in: {save_path}")
-                else:  # 'video' or 'stream'
-                    if vid_path != save_path:  # new video
-                        vid_path = save_path
-                        if isinstance(vid_writer, cv2.VideoWriter):
-                            vid_writer.release(
-                            )  # release previous video writer
-                        if vid_cap:  # video
-                            fps = vid_cap.get(cv2.CAP_PROP_FPS)
-                            w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                            h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                        else:  # stream
-                            fps, w, h = 30, im0.shape[1], im0.shape[0]
-                            save_path += '.mp4'
-                        vid_writer = cv2.VideoWriter(
-                            save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps,
-                            (w, h))
-                    vid_writer.write(im0)
+            # Save results
+            if save_vid:
+                vid_writer.write(raw_frame)
 
     frame_dets_to_json(dataset, all_dets, out_json_path)
 
@@ -204,10 +216,11 @@ def frame_dets_to_list(frame_dets: torch.Tensor) -> list:
     return out
 
 
-def frame_dets_to_json(dataset: LoadImages, frame_dets: torch.Tensor,
+def frame_dets_to_json(dataset: VideoDataset, frame_dets: torch.Tensor,
                        out_path: str) -> None:
     video_metadata = dict(
         filename=Path(dataset.path).name,
+        path=str(dataset.path),
         fps=dataset.fps,
         total_frames=dataset.nframes,
         duration=dataset.duration)
@@ -217,42 +230,36 @@ def frame_dets_to_json(dataset: LoadImages, frame_dets: torch.Tensor,
     out = dict(
         video_metadata=video_metadata,
         frame_predictions=list(frame_dets.values()))
+    makedirs(dirname(out_path), exist_ok=True)
     with open(out_path, 'w') as f:
         json.dump(out, f)
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
+    parser = ArgumentParser()
+    parser.add_argument('video', type=str, help='video')
     parser.add_argument(
-        '--weights',
-        nargs='+',
+        'out_json_path',
         type=str,
-        default='yolov7.pt',
-        help='model.pt path(s)')
+        help='Path to JSON file containing predictions.')
     parser.add_argument(
-        '--source', type=str, default='inference/images',
-        help='source')  # file/folder, 0 for webcam
+        'model_path', type=str, help='Model path. Can be an OpenVINO XML.')
     parser.add_argument(
-        '--img-size', type=int, default=640, help='inference size (pixels)')
-    parser.add_argument(
-        '--conf-thres',
+        '--conf-thresh',
         type=float,
         default=0.25,
         help='object confidence threshold')
     parser.add_argument(
-        '--iou-thres', type=float, default=0.45, help='IOU threshold for NMS')
+        '--iou-thresh', type=float, default=0.45, help='IOU threshold for NMS')
     parser.add_argument(
         '--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument(
-        '--view-img', action='store_true', help='display results')
+        '--img-size', type=int, default=640, help='inference size (pixels)')
+    parser.add_argument('--stride', type=int, default=32, help='model stride')
     parser.add_argument(
-        '--save-txt', action='store_true', help='save results to *.txt')
-    parser.add_argument(
-        '--save-conf',
-        action='store_true',
-        help='save confidences in --save-txt labels')
-    parser.add_argument(
-        '--nosave', action='store_true', help='do not save images/videos')
+        '--out-video-path',
+        type=str,
+        help='Save video with detections drawn here.')
     parser.add_argument(
         '--classes',
         nargs='+',
@@ -261,29 +268,30 @@ if __name__ == '__main__':
     parser.add_argument(
         '--agnostic-nms', action='store_true', help='class-agnostic NMS')
     parser.add_argument(
-        '--augment', action='store_true', help='augmented inference')
-    parser.add_argument(
-        '--update', action='store_true', help='update all models')
-    parser.add_argument(
-        '--project',
-        default='runs/detect',
-        help='save results to project/name')
-    parser.add_argument(
-        '--name', default='exp', help='save results to project/name')
-    parser.add_argument(
-        '--exist-ok',
-        action='store_true',
-        help='existing project/name ok, do not increment')
-    parser.add_argument(
-        '--no-trace', action='store_true', help='don`t trace model')
-    parser.add_argument('--openvino', type=str, help='openVINO model path')
-    parser.add_argument(
         '--frame-predict-interval',
         type=int,
         default=1,
         help='Predict only on frames-indices that are multiples of this.')
+    parser.add_argument('--batch-size', type=int, default=1, help='batch size')
+    parser.add_argument(
+        '--num-workers',
+        type=int,
+        default=0,
+        help='number of DataLoader workers')
+    parser.add_argument(
+        '--crop',
+        type=int,
+        nargs=4,
+        help='Window to crop frames to in xyxy format.')
+    parser.add_argument(
+        '--torchvision-video-reader',
+        action='store_true',
+        help='Use the TorchVision video reader instead of OpenCV.')
+    parser.add_argument('--debug', action='store_true', help='Debug mode.')
+    parser.add_argument("--config", action=ActionConfigFile)
     opt = parser.parse_args()
     print(opt)
 
-    with torch.inference_mode():
-        detect()
+    args = opt.as_dict()
+    del args['config']
+    detect(**args)

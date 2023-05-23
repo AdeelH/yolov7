@@ -1,0 +1,8 @@
+model_path: /home/adeel/yolov7/yolov7-tiny-1280-quantized.xml
+img_size: 1280
+classes: [0]
+conf_thresh: 0.10
+iou_thresh: 0.45
+device: cpu
+stride: 32
+debug: false
