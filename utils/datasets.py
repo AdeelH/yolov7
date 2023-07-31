@@ -22,14 +22,9 @@ import torchvision
 from torchvision.io import VideoReader
 from tqdm import tqdm
 
-import pickle
-from copy import deepcopy
-#from pycocotools import mask as maskUtils
-from torchvision.utils import save_image
-from torchvision.ops import roi_pool, roi_align, ps_roi_pool, ps_roi_align
-
-from utils.general import check_requirements, xyxy2xywh, xywh2xyxy, xywhn2xyxy, xyn2xy, segment2box, segments2boxes, \
-    resample_segments, clean_str
+from utils.general import (check_requirements, xyxy2xywh, xywh2xyxy,
+                           xywhn2xyxy, xyn2xy, segment2box, segments2boxes,
+                           resample_segments, clean_str)
 from utils.torch_utils import torch_distributed_zero_first
 
 # Parameters
@@ -83,7 +78,8 @@ def create_dataloader(path,
                       image_weights=False,
                       quad=False,
                       prefix=''):
-    # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
+    # Make sure only the first process in DDP process the dataset first, and
+    # the following others can use the cache
     with torch_distributed_zero_first(rank):
         dataset = LoadImagesAndLabels(
             path,
@@ -106,8 +102,10 @@ def create_dataloader(path,
     ])  # number of workers
     sampler = torch.utils.data.distributed.DistributedSampler(
         dataset) if rank != -1 else None
-    loader = torch.utils.data.DataLoader if image_weights else InfiniteDataLoader
-    # Use torch.utils.data.DataLoader() if dataset.properties will update during training else InfiniteDataLoader()
+    loader = (torch.utils.data.DataLoader
+              if image_weights else InfiniteDataLoader)
+    # Use torch.utils.data.DataLoader() if dataset.properties will update
+    # during training else InfiniteDataLoader()
     dataloader = loader(
         dataset,
         batch_size=batch_size,
@@ -182,8 +180,10 @@ class LoadImages:  # for inference
             self.new_video(videos[0])  # new video
         else:
             self.cap = None
-        assert self.nf > 0, f'No images or videos found in {p}. ' \
-                            f'Supported formats are:\nimages: {img_formats}\nvideos: {vid_formats}'
+        msg = (f'No images or videos found in {p}. '
+               f'Supported formats are:\nimages: '
+               f'{img_formats}\nvideos: {vid_formats}')
+        assert self.nf > 0, msg
 
     def __iter__(self):
         self.count = 0
@@ -209,14 +209,16 @@ class LoadImages:  # for inference
                     ret_val, img0 = self.cap.read()
 
             self.frame += 1
-            # print(f'video {self.count + 1}/{self.nf} ({self.frame}/{self.nframes}) {path}: ', end='')
+            print(
+                f'video {self.count + 1}/{self.nf} '
+                f'({self.frame}/{self.nframes}) {path}: ',
+                end='')
 
         else:
             # Read image
             self.count += 1
             img0 = cv2.imread(path)  # BGR
             assert img0 is not None, 'Image Not Found ' + path
-            #print(f'image {self.count}/{self.nf} {path}: ', end='')
 
         # Padded resize
         img = letterbox(
@@ -360,8 +362,10 @@ class LoadWebcam:  # for inference
         if pipe.isnumeric():
             pipe = eval(pipe)  # local camera
         # pipe = 'rtsp://192.168.1.64/1'  # IP camera
-        # pipe = 'rtsp://username:password@192.168.1.64/1'  # IP camera with login
-        # pipe = 'http://wmccpinetop.axiscam.net/mjpg/video.mjpg'  # IP golf camera
+        # IP camera with login
+        # pipe = 'rtsp://username:password@192.168.1.64/1'
+        # IP golf camera
+        # pipe = 'http://wmccpinetop.axiscam.net/mjpg/video.mjpg'
 
         self.pipe = pipe
         self.cap = cv2.VideoCapture(pipe)  # video capture object
@@ -508,7 +512,8 @@ class LoadStreams:  # multiple IP or RTSP cameras
 
 def img2label_paths(img_paths):
     # Define label paths as a function of image paths
-    sa, sb = os.sep + 'images' + os.sep, os.sep + 'labels' + os.sep  # /images/, /labels/ substrings
+    # /images/, /labels/ substrings
+    sa, sb = os.sep + 'images' + os.sep, os.sep + 'labels' + os.sep
     return [
         'txt'.join(x.replace(sa, sb, 1).rsplit(x.split('.')[-1], 1))
         for x in img_paths
@@ -534,11 +539,11 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.hyp = hyp
         self.image_weights = image_weights
         self.rect = False if image_weights else rect
-        self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
+        # load 4 images at a time into a mosaic (only during training)
+        self.mosaic = self.augment and not self.rect
         self.mosaic_border = [-img_size // 2, -img_size // 2]
         self.stride = stride
         self.path = path
-        #self.albumentations = Albumentations() if augment else None
 
         try:
             f = []  # image files
@@ -555,14 +560,12 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                             x.replace('./', parent)
                             if x.startswith('./') else x for x in t
                         ]  # local to global path
-                        # f += [p.parent / x.lstrip(os.sep) for x in t]  # local to global path (pathlib)
                 else:
                     raise Exception(f'{prefix}{p} does not exist')
             self.img_files = sorted([
                 x.replace('/', os.sep) for x in f
                 if x.split('.')[-1].lower() in img_formats
             ])
-            # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in img_formats])  # pathlib
             assert self.img_files, f'{prefix}No images found'
         except Exception as e:
             raise Exception(
@@ -575,21 +578,19 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                           '.cache')  # cached labels
         if cache_path.is_file():
             cache, exists = torch.load(cache_path), True  # load
-            #if cache['hash'] != get_hash(self.label_files + self.img_files) or 'version' not in cache:  # changed
-            #    cache, exists = self.cache_labels(cache_path, prefix), False  # re-cache
         else:
-            cache, exists = self.cache_labels(cache_path,
-                                              prefix), False  # cache
+            cache, exists = self.cache_labels(cache_path, prefix), False
 
         # Display cache
         nf, nm, ne, nc, n = cache.pop(
             'results')  # found, missing, empty, corrupted, total
         if exists:
-            d = f"Scanning '{cache_path}' images and labels... {nf} found, {nm} missing, {ne} empty, {nc} corrupted"
-            tqdm(
-                None, desc=prefix + d, total=n,
-                initial=n)  # display cache results
-        assert nf > 0 or not augment, f'{prefix}No labels in {cache_path}. Can not train without labels. See {help_url}'
+            d = (f"Scanning '{cache_path}' images and labels... {nf} found, "
+                 f"{nm} missing, {ne} empty, {nc} corrupted")
+            tqdm(None, desc=prefix + d, total=n, initial=n)
+        msg = (f'{prefix}No labels in {cache_path}. '
+               f'Can not train without labels. See {help_url}')
+        assert nf > 0 or not augment, msg
 
         # Read cache
         cache.pop('hash')  # remove hash
@@ -687,41 +688,46 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 if os.path.isfile(lb_file):
                     nf += 1  # label found
                     with open(lb_file, 'r') as f:
-                        l = [x.split() for x in f.read().strip().splitlines()]
-                        if any([len(x) > 8 for x in l]):  # is segment
+                        lines = f.readlines()
+                        line_items = [line.strip().split() for line in lines]
+                        if any(len(li) > 8 for li in line_items):  # is segment
                             classes = np.array(
-                                [x[0] for x in l], dtype=np.float32)
+                                [li[0] for li in line_items], dtype=np.float32)
                             segments = [
-                                np.array(x[1:], dtype=np.float32).reshape(
-                                    -1, 2) for x in l
-                            ]  # (cls, xy1...)
-                            l = np.concatenate((classes.reshape(-1, 1),
-                                                segments2boxes(segments)),
-                                               1)  # (cls, xywh)
-                        l = np.array(l, dtype=np.float32)
-                    if len(l):
-                        assert l.shape[1] == 5, 'labels require 5 columns each'
-                        assert (l >= 0).all(), 'negative labels'
-                        assert (l[:, 1:] <= 1).all(
-                        ), 'non-normalized or out of bounds coordinate labels'
-                        assert np.unique(
-                            l,
-                            axis=0).shape[0] == l.shape[0], 'duplicate labels'
+                                np.array(li[1:], dtype=np.float32).reshape(
+                                    -1, 2) for li in line_items
+                            ]
+                            # (cls, x, y, w, h)
+                            labels = np.concatenate((classes.reshape(-1, 1),
+                                                     segments2boxes(segments)),
+                                                    1)
+                        labels = np.array(labels, dtype=np.float32)
+                    if len(labels):
+                        msg = 'labels require 5 columns each'
+                        assert labels.shape[1] == 5, msg
+                        msg = 'negative labels'
+                        assert (labels >= 0).all(), msg
+                        msg = ('non-normalized or out of '
+                               'bounds coordinate labels')
+                        assert (labels[:, 1:] <= 1).all(), msg
+                        no_dups = (len(np.unique(labels[:, 0])) == len(labels))
+                        assert no_dups, 'duplicate labels'
                     else:
                         ne += 1  # label empty
-                        l = np.zeros((0, 5), dtype=np.float32)
+                        labels = np.zeros((0, 5), dtype=np.float32)
                 else:
                     nm += 1  # label missing
-                    l = np.zeros((0, 5), dtype=np.float32)
-                x[im_file] = [l, shape, segments]
+                    labels = np.zeros((0, 5), dtype=np.float32)
+                x[im_file] = [labels, shape, segments]
             except Exception as e:
                 nc += 1
                 print(
-                    f'{prefix}WARNING: Ignoring corrupted image and/or label {im_file}: {e}'
-                )
+                    f'{prefix}WARNING: Ignoring corrupted image and/or label '
+                    f'{im_file}: {e}')
 
-            pbar.desc = f"{prefix}Scanning '{path.parent / path.stem}' images and labels... " \
-                        f"{nf} found, {nm} missing, {ne} empty, {nc} corrupted"
+            pbar.desc = (f"{prefix}Scanning '{path.parent / path.stem}' "
+                         f"images and labels... {nf} found, {nm} missing, "
+                         f"{ne} empty, {nc} corrupted")
         pbar.close()
 
         if nf == 0:
@@ -737,12 +743,6 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
     def __len__(self):
         return len(self.img_files)
-
-    # def __iter__(self):
-    #     self.count = -1
-    #     print('ran dataset iter')
-    #     #self.shuffled_vector = np.random.permutation(self.nF) if self.augment else np.arange(self.nF)
-    #     return self
 
     def __getitem__(self, index):
         index = self.indices[index]  # linear, shuffled, or image_weights
@@ -900,7 +900,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         return torch.stack(img4, 0), torch.cat(label4, 0), path4, shapes4
 
 
-# Ancillary functions --------------------------------------------------------------------------------------------------
+# Ancillary functions ---------------------------------------------------------
 def load_image(self, index):
     # loads 1 image from dataset, returns img, original hw, resized hw
     img = self.imgs[index]
@@ -936,7 +936,8 @@ def augment_hsv(img, hgain=0.5, sgain=0.5, vgain=0.5):
 
 
 def hist_equalize(img, clahe=True, bgr=False):
-    # Equalize histogram on BGR image 'img' with img.shape(n,m,3) and range 0-255
+    # Equalize histogram on BGR image 'img' with img.shape(n,m,3) and
+    # range 0-255
     yuv = cv2.cvtColor(img, cv2.COLOR_BGR2YUV if bgr else cv2.COLOR_RGB2YUV)
     if clahe:
         c = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -1003,8 +1004,6 @@ def load_mosaic(self, index):
     # img4, labels4 = replicate(img4, labels4)  # replicate
 
     # Augment
-    #img4, labels4, segments4 = remove_background(img4, labels4, segments4)
-    #sample_segments(img4, labels4, segments4, probability=self.hyp['copy_paste'])
     img4, labels4, segments4 = copy_paste(
         img4, labels4, segments4, probability=self.hyp['copy_paste'])
     img4, labels4 = random_perspective(
@@ -1172,7 +1171,8 @@ def load_samples(self, index):
 
 
 def copy_paste(img, labels, segments, probability=0.5):
-    # Implement Copy-Paste augmentation https://arxiv.org/abs/2012.07177, labels as nx5 np.array(cls, xyxy)
+    # Implement Copy-Paste augmentation https://arxiv.org/abs/2012.07177,
+    # labels as nx5 np.array(cls, xyxy)
     n = len(segments)
     if probability and n:
         h, w, c = img.shape  # height, width, channels
@@ -1197,7 +1197,8 @@ def copy_paste(img, labels, segments, probability=0.5):
 
 
 def remove_background(img, labels, segments):
-    # Implement Copy-Paste augmentation https://arxiv.org/abs/2012.07177, labels as nx5 np.array(cls, xyxy)
+    # Implement Copy-Paste augmentation https://arxiv.org/abs/2012.07177,
+    # labels as nx5 np.array(cls, xyxy)
     n = len(segments)
     h, w, c = img.shape  # height, width, channels
     im_new = np.zeros(img.shape, np.uint8)
@@ -1215,7 +1216,8 @@ def remove_background(img, labels, segments):
 
 
 def sample_segments(img, labels, segments, probability=0.5):
-    # Implement Copy-Paste augmentation https://arxiv.org/abs/2012.07177, labels as nx5 np.array(cls, xyxy)
+    # Implement Copy-Paste augmentation https://arxiv.org/abs/2012.07177,
+    # labels as nx5 np.array(cls, xyxy)
     n = len(segments)
     sample_labels = []
     sample_images = []
@@ -1290,7 +1292,8 @@ def letterbox(img,
     # Compute padding
     ratio = r, r  # width, height ratios
     new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
-    dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]  # wh padding
+    # wh padding
+    dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]
     if auto:  # minimum rectangle
         dw, dh = np.mod(dw, stride), np.mod(dh, stride)  # wh padding
     elif scaleFill:  # stretch
@@ -1320,7 +1323,8 @@ def random_perspective(img,
                        shear=10,
                        perspective=0.0,
                        border=(0, 0)):
-    # torchvision.transforms.RandomAffine(degrees=(-10, 10), translate=(.1, .1), scale=(.9, 1.1), shear=(-10, 10))
+    # torchvision.transforms.RandomAffine(degrees=(-10, 10),
+    # translate=(.1, .1), scale=(.9, 1.1), shear=(-10, 10))
     # targets = [cls, xyxy]
 
     height = img.shape[0] + border[0] * 2  # shape(h,w,c)
@@ -1388,10 +1392,8 @@ def random_perspective(img,
                 xy = np.ones((len(segment), 3))
                 xy[:, :2] = segment
                 xy = xy @ M.T  # transform
-                xy = xy[:, :
-                        2] / xy[:, 2:
-                                3] if perspective else xy[:, :
-                                                          2]  # perspective rescale or affine
+                # perspective rescale or affine
+                xy = (xy[:, :2] / xy[:, 2:3] if perspective else xy[:, :2])
 
                 # clip
                 new[i] = segment2box(xy, width, height)
@@ -1427,7 +1429,8 @@ def random_perspective(img,
 
 def box_candidates(box1, box2, wh_thr=2, ar_thr=20, area_thr=0.1,
                    eps=1e-16):  # box1(4,n), box2(4,n)
-    # Compute candidate boxes: box1 before augment, box2 after augment, wh_thr (pixels), aspect_ratio_thr, area_ratio
+    # Compute candidate boxes: box1 before augment, box2 after augment, wh_thr
+    # (pixels), aspect_ratio_thr, area_ratio
     w1, h1 = box1[2] - box1[0], box1[3] - box1[1]
     w2, h2 = box2[2] - box2[0], box2[3] - box2[1]
     ar = np.maximum(w2 / (h2 + eps), h2 / (w2 + eps))  # aspect ratio
@@ -1436,7 +1439,8 @@ def box_candidates(box1, box2, wh_thr=2, ar_thr=20, area_thr=0.1,
 
 
 def bbox_ioa(box1, box2):
-    # Returns the intersection over box2 area given box1, box2. box1 is 4, box2 is nx4. boxes are x1y1x2y2
+    # Returns the intersection over box2 area given box1, box2. box1 is 4,
+    # box2 is nx4. boxes are x1y1x2y2
     box2 = box2.transpose()
 
     # Get the coordinates of bounding boxes
@@ -1444,8 +1448,9 @@ def bbox_ioa(box1, box2):
     b2_x1, b2_y1, b2_x2, b2_y2 = box2[0], box2[1], box2[2], box2[3]
 
     # Intersection area
-    inter_area = (np.minimum(b1_x2, b2_x2) - np.maximum(b1_x1, b2_x1)).clip(0) * \
-                 (np.minimum(b1_y2, b2_y2) - np.maximum(b1_y1, b2_y1)).clip(0)
+    inter_area = (
+        (np.minimum(b1_x2, b2_x2) - np.maximum(b1_x1, b2_x1)).clip(0) *
+        (np.minimum(b1_y2, b2_y2) - np.maximum(b1_y1, b2_y1)).clip(0))
 
     # box2 area
     box2_area = (b2_x2 - b2_x1) * (b2_y2 - b2_y1) + 1e-16
@@ -1600,7 +1605,8 @@ def flatten_recursive(path='../coco'):
 def extract_boxes(
         path='../coco/'
 ):  # from utils.datasets import *; extract_boxes('../coco128')
-    # Convert detection dataset into classification dataset, with one directory per class
+    # Convert detection dataset into classification dataset, with one directory
+    # per class
 
     path = Path(path)  # images dir
     shutil.rmtree(path / 'classifier') if (
@@ -1643,7 +1649,9 @@ def extract_boxes(
 
 
 def autosplit(path='../coco', weights=(0.9, 0.1, 0.0), annotated_only=False):
-    """ Autosplit a dataset into train/val/test splits and save path/autosplit_*.txt files
+    """ Autosplit a dataset into train/val/test splits and save
+    path/autosplit_*.txt files.
+
     Usage: from utils.datasets import *; autosplit('../coco')
     Arguments
         path:           Path to images directory
@@ -1665,14 +1673,14 @@ def autosplit(path='../coco', weights=(0.9, 0.1, 0.0), annotated_only=False):
     print(f'Autosplitting images from {path}' +
           ', using *.txt labeled images only' * annotated_only)
     for i, img in tqdm(zip(indices, files), total=n):
-        if not annotated_only or Path(img2label_paths(
-            [str(img)])[0]).exists():  # check label
+        # check label
+        if not annotated_only or Path(img2label_paths([str(img)])[0]).exists():
             with open(path / txt[i], 'a') as f:
                 f.write(str(img) + '\n')  # add image to txt file
 
 
 def load_segmentations(self, index):
     key = '/work/handsomejw66/coco17/' + self.img_files[index]
-    #print(key)
+    # print(key)
     # /work/handsomejw66/coco17/
     return self.segs[key]
