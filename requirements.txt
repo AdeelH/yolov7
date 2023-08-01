@@ -39,3 +39,6 @@ thop  # FLOPs computation
 # roboflow
 
 openvino-dev
+
+# for heridal dataset
+xmltodict

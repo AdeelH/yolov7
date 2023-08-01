@@ -1,5 +1,5 @@
 # Dataset utils and dataloaders
-
+from typing import List
 import glob
 import logging
 import math
@@ -11,6 +11,7 @@ from itertools import repeat
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
 from threading import Thread
+import xmltodict
 
 import cv2
 import numpy as np
@@ -35,6 +36,8 @@ img_formats = [
 vid_formats = ['mov', 'avi', 'mp4', 'mpg', 'mpeg', 'm4v', 'wmv',
                'mkv']  # acceptable video suffixes
 logger = logging.getLogger(__name__)
+
+HERIDAL_DATA_CLASS_NAME_TO_ID = dict(human=0)
 
 # Get orientation exif tag
 for orientation in ExifTags.TAGS.keys():
@@ -62,22 +65,25 @@ def exif_size(img):
     return s
 
 
-def create_dataloader(path,
-                      imgsz,
-                      batch_size,
-                      stride,
-                      opt,
-                      hyp=None,
-                      augment=False,
-                      cache=False,
-                      pad=0.0,
-                      rect=False,
-                      rank=-1,
-                      world_size=1,
-                      workers=8,
-                      image_weights=False,
-                      quad=False,
-                      prefix=''):
+def create_dataloader(
+        path,
+        imgsz,
+        batch_size,
+        stride,
+        opt,
+        hyp=None,
+        augment=False,
+        cache=False,
+        pad=0.0,
+        rect=False,
+        rank=-1,
+        world_size=1,
+        workers=8,
+        image_weights=False,
+        quad=False,
+        prefix='',
+        label_ext: str = 'txt',
+):
     # Make sure only the first process in DDP process the dataset first, and
     # the following others can use the cache
     with torch_distributed_zero_first(rank):
@@ -93,7 +99,8 @@ def create_dataloader(path,
             stride=int(stride),
             pad=pad,
             image_weights=image_weights,
-            prefix=prefix)
+            prefix=prefix,
+            label_ext=label_ext)
 
     batch_size = min(batch_size, len(dataset))
     nw = min([
@@ -510,30 +517,83 @@ class LoadStreams:  # multiple IP or RTSP cameras
         return 0  # 1E12 frames = 32 streams at 30 FPS for 30 years
 
 
-def img2label_paths(img_paths):
+def img2label_paths(img_paths: List[str], ext: str = 'txt') -> List[str]:
     # Define label paths as a function of image paths
     # /images/, /labels/ substrings
     sa, sb = os.sep + 'images' + os.sep, os.sep + 'labels' + os.sep
     return [
-        'txt'.join(x.replace(sa, sb, 1).rsplit(x.split('.')[-1], 1))
+        ext.join(x.replace(sa, sb, 1).rsplit(x.split('.')[-1], 1))
         for x in img_paths
     ]
 
 
+def get_txt_labels(path: str) -> np.ndarray:
+    with open(path, 'r') as f:
+        lines = f.readlines()
+    line_items = [line.strip().split() for line in lines]
+    is_segment = any(len(li) > 8 for li in line_items)
+    if not is_segment:
+        labels = np.array(line_items, dtype=np.float32)
+    else:
+        class_ids = [li[0] for li in line_items]
+        class_ids = np.array(class_ids, dtype=np.float32)
+        segments = [li[1:] for li in line_items]
+        segments = [
+            np.array(s, dtype=np.float32).reshape(-1, 2) for s in segments
+        ]
+        boxes_xywh = segments2boxes(segments)
+        # (cls, x, y, w, h)
+        labels = np.concatenate((class_ids.reshape(-1, 1), boxes_xywh), axis=1)
+    return labels
+
+
+def get_xml_labels(path: str, class_name_to_id: dict) -> np.ndarray:
+    with open(path, 'rb') as f:
+        data = xmltodict.parse(f)
+    annotations = data.get('annotation')
+    if annotations is None:
+        annotations = {}
+    annotations = annotations.get('object')
+    if annotations is None:
+        return np.empty((0, 5), dtype=np.float32)
+    if not isinstance(annotations, list):
+        annotations = [annotations]
+    class_names = [a['name'] for a in annotations]
+    class_ids = [class_name_to_id.get(name, -1) for name in class_names]
+    class_ids = np.array(class_ids, np.float32)[:, np.newaxis]
+
+    xyxy_dicts = [a['bndbox'] for a in annotations]
+    boxes_xyxy = [(d['xmin'], d['ymin'], d['xmax'], d['ymax'])
+                  for d in xyxy_dicts]
+    width = int(data['annotation']['size']['width'])
+    height = int(data['annotation']['size']['height'])
+    boxes_xyxy = np.array(boxes_xyxy, dtype=np.float32)
+    boxes_xyxy[:, [0, 2]] /= width
+    boxes_xyxy[:, [1, 3]] /= height
+    boxes_xywh = xyxy2xywh(boxes_xyxy)
+
+    labels = np.concatenate([class_ids, boxes_xywh], axis=1)
+
+    return labels
+
+
 class LoadImagesAndLabels(Dataset):  # for training/testing
-    def __init__(self,
-                 path,
-                 img_size=640,
-                 batch_size=16,
-                 augment=False,
-                 hyp=None,
-                 rect=False,
-                 image_weights=False,
-                 cache_images=False,
-                 single_cls=False,
-                 stride=32,
-                 pad=0.0,
-                 prefix=''):
+    def __init__(
+            self,
+            path,
+            img_size=640,
+            batch_size=16,
+            augment=False,
+            hyp=None,
+            rect=False,
+            image_weights=False,
+            cache_images=False,
+            single_cls=False,
+            stride=32,
+            pad=0.0,
+            prefix='',
+            label_ext: str = 'txt',
+    ):
         self.img_size = img_size
         self.augment = augment
         self.hyp = hyp
@@ -544,6 +604,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.mosaic_border = [-img_size // 2, -img_size // 2]
         self.stride = stride
         self.path = path
+        self.label_ext = label_ext
 
         try:
             f = []  # image files
@@ -572,7 +633,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 f'{prefix}Error loading data from {path}: {e}\nSee {help_url}')
 
         # Check cache
-        self.label_files = img2label_paths(self.img_files)  # labels
+        self.label_files = img2label_paths(self.img_files, ext=self.label_ext)
         cache_path = (p if p.is_file()
                       else Path(self.label_files[0]).parent).with_suffix(
                           '.cache')  # cached labels
@@ -582,8 +643,8 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             cache, exists = self.cache_labels(cache_path, prefix), False
 
         # Display cache
-        nf, nm, ne, nc, n = cache.pop(
-            'results')  # found, missing, empty, corrupted, total
+        # found, missing, empty, corrupted, total
+        nf, nm, ne, nc, n = cache.pop('results')
         if exists:
             d = (f"Scanning '{cache_path}' images and labels... {nf} found, "
                  f"{nm} missing, {ne} empty, {nc} corrupted")
@@ -673,57 +734,53 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             desc='Scanning images',
             total=len(self.img_files))
         for i, (im_file, lb_file) in enumerate(pbar):
-            try:
-                # verify images
-                im = Image.open(im_file)
-                im.verify()  # PIL verify
-                shape = exif_size(im)  # image size
-                segments = []  # instance segments
-                assert (shape[0] > 9) & (shape[1] >
-                                         9), f'image size {shape} <10 pixels'
-                assert im.format.lower(
-                ) in img_formats, f'invalid image format {im.format}'
+            # try:
+            # verify images
+            im = Image.open(im_file)
+            im.verify()  # PIL verify
+            shape = exif_size(im)  # image size
+            segments = []  # instance segments
+            assert (shape[0] > 9) & (shape[1] >
+                                     9), f'image size {shape} <10 pixels'
+            assert im.format.lower(
+            ) in img_formats, f'invalid image format {im.format}'
 
-                # verify labels
-                if os.path.isfile(lb_file):
-                    nf += 1  # label found
-                    with open(lb_file, 'r') as f:
-                        lines = f.readlines()
-                        line_items = [line.strip().split() for line in lines]
-                        if any(len(li) > 8 for li in line_items):  # is segment
-                            classes = np.array(
-                                [li[0] for li in line_items], dtype=np.float32)
-                            segments = [
-                                np.array(li[1:], dtype=np.float32).reshape(
-                                    -1, 2) for li in line_items
-                            ]
-                            # (cls, x, y, w, h)
-                            labels = np.concatenate((classes.reshape(-1, 1),
-                                                     segments2boxes(segments)),
-                                                    1)
-                        labels = np.array(labels, dtype=np.float32)
-                    if len(labels):
-                        msg = 'labels require 5 columns each'
-                        assert labels.shape[1] == 5, msg
-                        msg = 'negative labels'
-                        assert (labels >= 0).all(), msg
-                        msg = ('non-normalized or out of '
-                               'bounds coordinate labels')
-                        assert (labels[:, 1:] <= 1).all(), msg
-                        no_dups = (len(np.unique(labels[:, 0])) == len(labels))
-                        assert no_dups, 'duplicate labels'
-                    else:
-                        ne += 1  # label empty
-                        labels = np.zeros((0, 5), dtype=np.float32)
+            # verify labels
+            if os.path.isfile(lb_file):
+                nf += 1  # label found
+
+                _, ext = os.path.splitext(lb_file)
+                if ext.lower() == '.txt':
+                    labels = get_txt_labels(lb_file)
+                elif ext.lower() == '.xml':
+                    labels = get_xml_labels(lb_file,
+                                            HERIDAL_DATA_CLASS_NAME_TO_ID)
                 else:
-                    nm += 1  # label missing
+                    raise NotImplementedError()
+
+                if len(labels):
+                    msg = 'labels require 5 columns each'
+                    assert labels.shape[1] == 5, msg
+                    msg = 'negative labels'
+                    assert (labels >= 0).all(), msg
+                    msg = ('non-normalized or out of '
+                           'bounds coordinate labels')
+                    assert (labels[:, 1:] <= 1).all(), msg
+                    no_duplicate_rows = (len(np.unique(labels,
+                                                       axis=0)) == len(labels))
+                    assert no_duplicate_rows, 'duplicate labels'
+                else:
+                    ne += 1  # label empty
                     labels = np.zeros((0, 5), dtype=np.float32)
-                x[im_file] = [labels, shape, segments]
-            except Exception as e:
-                nc += 1
-                print(
-                    f'{prefix}WARNING: Ignoring corrupted image and/or label '
-                    f'{im_file}: {e}')
+            else:
+                nm += 1  # label missing
+                labels = np.zeros((0, 5), dtype=np.float32)
+            x[im_file] = [labels, shape, segments]
+            # except Exception as e:
+            #     nc += 1
+            #     print(
+            #         f'{prefix}WARNING: Ignoring corrupted image and/or label '
+            #         f'{im_file}: {e}')
 
             pbar.desc = (f"{prefix}Scanning '{path.parent / path.stem}' "
                          f"images and labels... {nf} found, {nm} missing, "
