@@ -766,9 +766,12 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     msg = ('non-normalized or out of '
                            'bounds coordinate labels')
                     assert (labels[:, 1:] <= 1).all(), msg
-                    no_duplicate_rows = (len(np.unique(labels,
-                                                       axis=0)) == len(labels))
-                    assert no_duplicate_rows, 'duplicate labels'
+                    unique_rows = np.unique(labels, axis=0)
+                    has_duplicate_rows = len(unique_rows) != len(labels)
+                    if has_duplicate_rows:
+                        logger.info(f'Duplicate rows found ({lb_file})')
+                        labels = unique_rows
+                    # assert not has_duplicate_rows, 'duplicate labels'
                 else:
                     ne += 1  # label empty
                     labels = np.zeros((0, 5), dtype=np.float32)
