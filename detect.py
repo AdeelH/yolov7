@@ -9,6 +9,7 @@ import numpy as np
 import cv2
 import torch
 from torch.utils.data import DataLoader
+from rastervision.core.box import Box
 
 from models.experimental import attempt_load
 from utils.datasets import VideoDataset, VideoDatasetTorchVision
@@ -50,6 +51,8 @@ def detect(video: str,
            torchvision_video_reader: bool = False,
            batch_size: Optional[int] = None,
            num_workers: int = 0,
+           chip_size: Optional[int] = None,
+           chip_stride: Optional[int] = None,
            debug: bool = False):
     # Initialize
     set_logging()
@@ -116,50 +119,83 @@ def detect(video: str,
     fps = dataset.fps
     all_dets = {}
     frames_processed = 0
+    do_chip = chip_size is not None
+    if do_chip and chip_stride is None:
+        chip_stride = chip_size
+
+    H, W = img_size, img_size
+    if do_chip:
+        extent = Box(0, 0, H, W)
+        windows = extent.get_windows(chip_size, chip_stride, padding=0)
+        slices = [w.to_slices() for w in windows]
+        chips_per_img = len(windows)
+        offsets = torch.tensor(
+            [[w.xmin, w.ymin, w.xmin, w.ymin, 0, 0] for w in windows],
+            device=device,
+            dtype=torch.float32)
+
     for batch in dataloader:
         if debug and frames_processed >= 50:
             break
-        img, raw_frames = batch
-        N = len(img)
+        imgs, raw_frames = batch
+        imgs: torch.Tensor
+        if imgs.ndim == 3:
+            imgs = imgs.unsqueeze(0)
+
+        N, *_ = imgs.shape
+        if do_chip:
+            imgs = torch.cat(
+                [
+                    torch.stack(
+                        [img[:, xslice, yslice] for xslice, yslice in slices])
+                    for img in imgs
+                ],
+                dim=0)
+
         raw_frames = raw_frames.numpy()
         batch_frame_inds = frames_processed + np.arange(N, dtype=int)
         frames_processed += N
         batch_frame_timestamps = duration * (batch_frame_inds / nframes)
-        img = img.to(device=device, dtype=torch.float32)
-        img /= 255.0
-        if img.ndimension() == 3:
-            img = img.unsqueeze(0)
 
+        imgs = imgs.to(device=device, dtype=torch.float32)
+        imgs /= 255.0
         # Inference
         if is_openvino:
             t1 = time_synchronized()
             with torch.inference_mode():
-                pred = model(img)[output_blob]
-                pred = torch.from_numpy(pred)
+                preds = model(imgs)[output_blob]
+                preds = torch.from_numpy(preds)
             t2 = time_synchronized()
         else:
             t1 = time_synchronized()
             with torch.inference_mode():
-                pred = model(img)[0]
+                preds = model(imgs)[0]
             t2 = time_synchronized()
 
         # Apply NMS
-        pred = non_max_suppression(
-            pred,
+        preds = non_max_suppression(
+            preds,
             conf_thresh,
             iou_thresh,
             classes=classes,
             agnostic=agnostic_nms)
         t3 = time_synchronized()
 
+        preds = [
+            torch.cat([
+                p + offset for p, offset in zip(
+                    preds[i * chips_per_img:(i + 1) * chips_per_img], offsets)
+            ]) for i in range(N)
+        ]
+
         # Process detections
         for i, (det, raw_frame, frame_idx, frame_timestamp) in enumerate(
-                zip(pred, raw_frames, batch_frame_inds,
+                zip(preds, raw_frames, batch_frame_inds,
                     batch_frame_timestamps)):
             print(f'({frame_idx}/{nframes}): ', end='')
             if len(det):
                 # Rescale boxes from img_size to raw_frame size
-                det[:, :4] = scale_coords(img.shape[2:], det[:, :4],
+                det[:, :4] = scale_coords((H, W), det[:, :4],
                                           raw_frame.shape).round()
 
                 all_dets[frame_idx] = dict(
@@ -244,6 +280,7 @@ if __name__ == '__main__':
         help='Path to JSON file containing predictions.')
     parser.add_argument(
         'model_path', type=str, help='Model path. Can be an OpenVINO XML.')
+    parser.add_argument("--config", action=ActionConfigFile)
     parser.add_argument(
         '--conf-thresh',
         type=float,
@@ -287,8 +324,9 @@ if __name__ == '__main__':
         '--torchvision-video-reader',
         action='store_true',
         help='Use the TorchVision video reader instead of OpenCV.')
+    parser.add_argument('--chip-size', type=int, help='')
+    parser.add_argument('--chip-stride', type=int, help='')
     parser.add_argument('--debug', action='store_true', help='Debug mode.')
-    parser.add_argument("--config", action=ActionConfigFile)
     opt = parser.parse_args()
     print(opt)
 
