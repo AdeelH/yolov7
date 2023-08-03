@@ -186,6 +186,10 @@ def detect(video: str,
                             color=colors[int(cls)],
                             line_thickness=4)
 
+                    if save_img or view_img:  # Add bbox to image
+                        label = f'{names[int(cls)]} {conf:.2f}'
+                        plot_one_box(xyxy, im0, label=label, color=colors[int(cls)], line_thickness=4)
+
             # Print time (inference + NMS)
             print(f'Done. ({(1E3 * (t2 - t1)):.1f}ms) Inference, '
                   f'({(1E3 * (t3 - t2)):.1f}ms) NMS')
