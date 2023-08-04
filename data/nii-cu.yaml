@@ -9,4 +9,4 @@ test: data/nii-cu/val/
 nc: 1
 
 # class names
-names: [ 'human']
+names: ['human']

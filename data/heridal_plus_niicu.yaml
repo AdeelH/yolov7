@@ -1,9 +1,9 @@
 # COCO 2017 dataset http://cocodataset.org
 
 # train and val data as 1) directory: path/images/, 2) file: path/images.txt, or 3) list: [path1/images/, path2/images/]
-train: data/heridal/train/
-val: data/heridal/test/
-test: data/heridal/test/
+train: [data/heridal/train/, data/nii-cu/train/]
+val: [data/heridal/test/, data/nii-cu/val/]
+test: [data/heridal/test/, data/nii-cu/val/]
 
 # number of classes
 nc: 1
