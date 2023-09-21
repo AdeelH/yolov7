@@ -9,6 +9,7 @@ import numpy as np
 import cv2
 import torch
 from torch.utils.data import DataLoader
+from rastervision.core.box import Box
 
 from models.experimental import attempt_load
 from utils.datasets import VideoDataset, VideoDatasetTorchVision
@@ -17,21 +18,7 @@ from utils.general import (check_img_size, non_max_suppression, scale_coords,
 from utils.plots import plot_one_box
 from utils.torch_utils import select_device, time_synchronized
 
-CLASS_NAMES = [
-    'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train',
-    'truck', 'boat', 'traffic light', 'fire hydrant', 'stop sign',
-    'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow',
-    'elephant', 'bear', 'zebra', 'giraffe', 'backpack', 'umbrella', 'handbag',
-    'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball', 'kite',
-    'baseball bat', 'baseball glove', 'skateboard', 'surfboard',
-    'tennis racket', 'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon',
-    'bowl', 'banana', 'apple', 'sandwich', 'orange', 'broccoli', 'carrot',
-    'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch', 'potted plant',
-    'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse', 'remote',
-    'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink',
-    'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear',
-    'hair drier', 'toothbrush'
-]
+CLASS_NAMES = ['person']
 
 
 def detect(video: str,
@@ -50,6 +37,10 @@ def detect(video: str,
            torchvision_video_reader: bool = False,
            batch_size: Optional[int] = None,
            num_workers: int = 0,
+           chip_size: Optional[int] = None,
+           chip_stride: Optional[int] = None,
+           t_min: float = 0,
+           t_max: Optional[float] = None,
            debug: bool = False):
     # Initialize
     set_logging()
@@ -87,12 +78,14 @@ def detect(video: str,
         read_interval=frame_predict_interval,
         crop_xyxy=crop,
     )
-    dataloader = DataLoader(
-        dataset, batch_size=batch_size, num_workers=num_workers)
+    dataloader = DataLoader(dataset,
+                            batch_size=batch_size,
+                            num_workers=num_workers)
 
     # init vid_writer
     save_vid = out_video_path is not None
     if save_vid:
+        makedirs(dirname(out_video_path), exist_ok=True)
         fps = dataset.fps
         w = dataset.frame_w
         h = dataset.frame_h
@@ -116,56 +109,94 @@ def detect(video: str,
     fps = dataset.fps
     all_dets = {}
     frames_processed = 0
+    do_chip = chip_size is not None
+    if do_chip and chip_stride is None:
+        chip_stride = chip_size
+
+    H, W = img_size, img_size
+    if do_chip:
+        extent = Box(0, 0, H, W)
+        windows = extent.get_windows(chip_size, chip_stride, padding=0)
+        slices = [w.to_slices() for w in windows]
+        chips_per_img = len(windows)
+        offsets = torch.tensor([[w.xmin, w.ymin, w.xmin, w.ymin, 0, 0]
+                                for w in windows],
+                               device=device,
+                               dtype=torch.float32)
+
+    if t_max is None:
+        t_max = nframes / fps
+
     for batch in dataloader:
         if debug and frames_processed >= 50:
             break
-        img, raw_frames = batch
-        N = len(img)
+        imgs, raw_frames = batch
+        imgs: torch.Tensor
+        if imgs.ndim == 3:
+            imgs = imgs.unsqueeze(0)
+
+        N, *_ = imgs.shape
+        if do_chip:
+            img_chips = [
+                torch.stack(
+                    [img[:, xslice, yslice] for xslice, yslice in slices])
+                for img in imgs
+            ]
+            imgs = torch.cat(img_chips, dim=0)
+
         raw_frames = raw_frames.numpy()
         batch_frame_inds = frames_processed + np.arange(N, dtype=int)
         frames_processed += N
         batch_frame_timestamps = duration * (batch_frame_inds / nframes)
-        img = img.to(device=device, dtype=torch.float32)
-        img /= 255.0
-        if img.ndimension() == 3:
-            img = img.unsqueeze(0)
 
+        if batch_frame_timestamps[-1] < t_min:
+            continue
+        if batch_frame_timestamps[0] > t_max:
+            break
+
+        imgs = imgs.to(device=device, dtype=torch.float32)
+        imgs /= 255.0
         # Inference
         if is_openvino:
             t1 = time_synchronized()
             with torch.inference_mode():
-                pred = model(img)[output_blob]
-                pred = torch.from_numpy(pred)
+                preds = model(imgs)[output_blob]
+                preds = torch.from_numpy(preds)
             t2 = time_synchronized()
         else:
             t1 = time_synchronized()
             with torch.inference_mode():
-                pred = model(img)[0]
+                preds = model(imgs)[0]
             t2 = time_synchronized()
 
         # Apply NMS
-        pred = non_max_suppression(
-            pred,
-            conf_thresh,
-            iou_thresh,
-            classes=classes,
-            agnostic=agnostic_nms)
+        preds: list = non_max_suppression(preds,
+                                          conf_thresh,
+                                          iou_thresh,
+                                          classes=classes,
+                                          agnostic=agnostic_nms)
         t3 = time_synchronized()
+
+        if do_chip:
+            cpi = chips_per_img
+            chip_preds = [preds[i:i + cpi] for i in range(0, N, cpi)]
+            chip_preds = [[p + off for p, off in zip(cp, offsets)]
+                          for cp in chip_preds]
+            preds = [torch.cat(cp) for cp in chip_preds]
 
         # Process detections
         for i, (det, raw_frame, frame_idx, frame_timestamp) in enumerate(
-                zip(pred, raw_frames, batch_frame_inds,
+                zip(preds, raw_frames, batch_frame_inds,
                     batch_frame_timestamps)):
             print(f'({frame_idx}/{nframes}): ', end='')
             if len(det):
                 # Rescale boxes from img_size to raw_frame size
-                det[:, :4] = scale_coords(img.shape[2:], det[:, :4],
+                det[:, :4] = scale_coords((H, W), det[:, :4],
                                           raw_frame.shape).round()
 
-                all_dets[frame_idx] = dict(
-                    frame_idx=int(frame_idx),
-                    timestamp=float(frame_timestamp),
-                    det=det)
+                all_dets[frame_idx] = dict(frame_idx=int(frame_idx),
+                                           timestamp=float(frame_timestamp),
+                                           det=det)
 
                 # Print results
                 s = ''
@@ -179,16 +210,11 @@ def detect(video: str,
                     for *xyxy, conf, cls in reversed(det):
                         cls = int(cls)
                         label = f'{CLASS_NAMES[cls]} {conf:.2f}'
-                        plot_one_box(
-                            xyxy,
-                            raw_frame,
-                            label=label,
-                            color=colors[int(cls)],
-                            line_thickness=4)
-
-                    if save_img or view_img:  # Add bbox to image
-                        label = f'{names[int(cls)]} {conf:.2f}'
-                        plot_one_box(xyxy, im0, label=label, color=colors[int(cls)], line_thickness=4)
+                        plot_one_box(xyxy,
+                                     raw_frame,
+                                     label=label,
+                                     color=colors[int(cls)],
+                                     line_thickness=4)
 
             # Print time (inference + NMS)
             print(f'Done. ({(1E3 * (t2 - t1)):.1f}ms) Inference, '
@@ -206,11 +232,10 @@ def detect(video: str,
 def det_to_dict(det: list) -> dict:
     *xyxy, conf, class_id = det
     class_id = int(class_id)
-    out = dict(
-        xyxy=xyxy,
-        conf=conf,
-        class_id=class_id,
-        class_name=CLASS_NAMES[class_id])
+    out = dict(xyxy=xyxy,
+               conf=conf,
+               class_id=class_id,
+               class_name=CLASS_NAMES[class_id])
     return out
 
 
@@ -222,18 +247,16 @@ def frame_dets_to_list(frame_dets: torch.Tensor) -> list:
 
 def frame_dets_to_json(dataset: VideoDataset, frame_dets: torch.Tensor,
                        out_path: str) -> None:
-    video_metadata = dict(
-        filename=Path(dataset.path).name,
-        path=str(dataset.path),
-        fps=dataset.fps,
-        total_frames=dataset.nframes,
-        duration=dataset.duration)
+    video_metadata = dict(filename=Path(dataset.path).name,
+                          path=str(dataset.path),
+                          fps=dataset.fps,
+                          total_frames=dataset.nframes,
+                          duration=dataset.duration)
     for v in frame_dets.values():
         v['predictions'] = frame_dets_to_list(v['det'])
         del v['det']
-    out = dict(
-        video_metadata=video_metadata,
-        frame_predictions=list(frame_dets.values()))
+    out = dict(video_metadata=video_metadata,
+               frame_predictions=list(frame_dets.values()))
     makedirs(dirname(out_path), exist_ok=True)
     with open(out_path, 'w') as f:
         json.dump(out, f)
@@ -242,57 +265,63 @@ def frame_dets_to_json(dataset: VideoDataset, frame_dets: torch.Tensor,
 if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument('video', type=str, help='video')
-    parser.add_argument(
-        'out_json_path',
-        type=str,
-        help='Path to JSON file containing predictions.')
-    parser.add_argument(
-        'model_path', type=str, help='Model path. Can be an OpenVINO XML.')
-    parser.add_argument(
-        '--conf-thresh',
-        type=float,
-        default=0.25,
-        help='object confidence threshold')
-    parser.add_argument(
-        '--iou-thresh', type=float, default=0.45, help='IOU threshold for NMS')
-    parser.add_argument(
-        '--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
-    parser.add_argument(
-        '--img-size', type=int, default=640, help='inference size (pixels)')
+    parser.add_argument('out_json_path',
+                        type=str,
+                        help='Path to JSON file containing predictions.')
+    parser.add_argument('model_path',
+                        type=str,
+                        help='Model path. Can be an OpenVINO XML.')
+    parser.add_argument('--config', action=ActionConfigFile)
+    parser.add_argument('--conf-thresh',
+                        type=float,
+                        default=0.25,
+                        help='object confidence threshold')
+    parser.add_argument('--iou-thresh',
+                        type=float,
+                        default=0.45,
+                        help='IOU threshold for NMS')
+    parser.add_argument('--device',
+                        default='',
+                        help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
+    parser.add_argument('--img-size',
+                        type=int,
+                        default=640,
+                        help='inference size (pixels)')
     parser.add_argument('--stride', type=int, default=32, help='model stride')
-    parser.add_argument(
-        '--out-video-path',
-        type=str,
-        help='Save video with detections drawn here.')
-    parser.add_argument(
-        '--classes',
-        nargs='+',
-        type=int,
-        help='filter by class: --class 0, or --class 0 2 3')
-    parser.add_argument(
-        '--agnostic-nms', action='store_true', help='class-agnostic NMS')
+    parser.add_argument('--out-video-path',
+                        type=str,
+                        default=None,
+                        help='Save video with detections drawn here.')
+    parser.add_argument('--classes',
+                        nargs='+',
+                        type=int,
+                        help='filter by class: --class 0, or --class 0 2 3')
+    parser.add_argument('--agnostic-nms',
+                        action='store_true',
+                        help='class-agnostic NMS')
     parser.add_argument(
         '--frame-predict-interval',
         type=int,
         default=1,
         help='Predict only on frames-indices that are multiples of this.')
     parser.add_argument('--batch-size', type=int, default=1, help='batch size')
-    parser.add_argument(
-        '--num-workers',
-        type=int,
-        default=0,
-        help='number of DataLoader workers')
-    parser.add_argument(
-        '--crop',
-        type=int,
-        nargs=4,
-        help='Window to crop frames to in xyxy format.')
+    parser.add_argument('--num-workers',
+                        type=int,
+                        default=0,
+                        help='number of DataLoader workers')
+    parser.add_argument('--crop',
+                        type=int,
+                        nargs=4,
+                        help='Window to crop frames to in xyxy format.')
     parser.add_argument(
         '--torchvision-video-reader',
         action='store_true',
         help='Use the TorchVision video reader instead of OpenCV.')
+    parser.add_argument('--chip-size', type=int, default=None, help='')
+    parser.add_argument('--chip-stride', type=int, default=None, help='')
     parser.add_argument('--debug', action='store_true', help='Debug mode.')
-    parser.add_argument("--config", action=ActionConfigFile)
+    parser.add_argument('--t_min', type=float, default=0, help='')
+    parser.add_argument('--t_max', type=float, default=None, help='')
     opt = parser.parse_args()
     print(opt)
 
