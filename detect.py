@@ -55,6 +55,7 @@ def detect(video: str,
         [np.random.randint(0, 255, size=3).tolist() for _ in CLASS_NAMES[1:]])
 
     is_openvino = Path(model_path).suffix == '.xml'
+    is_onnx = Path(model_path).suffix == '.onnx'
     if is_openvino:
         from openvino.runtime import Core
         core = Core()
@@ -62,6 +63,8 @@ def detect(video: str,
         model = core.read_model(model_path)
         model = core.compile_model(model, 'CPU')
         output_blob = model.output(0)
+    elif is_onnx:
+        pass
     else:
         model = attempt_load(model_path, map_location=device)
 
