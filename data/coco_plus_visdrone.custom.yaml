@@ -1,0 +1,9 @@
+train: [data/coco/train2017.txt, data/visdrone/VisDrone2019-DET/train/]
+val: [data/coco/val2017.txt, data/visdrone/VisDrone2019-DET/val/]
+test: [data/coco/val2017.txt, data/visdrone/VisDrone2019-DET/val/]
+
+# number of classes
+nc: 1
+
+# class names
+names: ['human']
